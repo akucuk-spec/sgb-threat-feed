@@ -1,0 +1,72 @@
+name: SGB Feed Sync and Public Pages
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sgb-feed-publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Fetch official SGB lists
+        env:
+          DATA_DIR: public
+          PAGE_SIZE: '1000'
+        run: python app.py --once
+      - name: Validate all feeds before publication
+        run: |
+          python - <<'PY'
+          import json, pathlib, datetime
+          root = pathlib.Path('public')
+          s = json.loads((root/'status.json').read_text())
+          assert s.get('running') is False, 'Sync unfinished'
+          assert set(['ip','domain','url']).issubset(s['feeds']), 'Feed missing'
+          for kind in ['ip','domain','url']:
+              feed = s['feeds'][kind]
+              assert feed['ok'] and feed['count'] > 0, f'{kind} not successful: {feed}'
+              p = root / f'{kind}-list.txt'
+              assert p.exists() and p.stat().st_size > 0, f'{p} missing'
+          chunks = sorted(root.glob('domain-part-*.txt'))
+          assert chunks, 'No domain chunks'
+          domains = sum(sum(1 for _ in p.open(encoding='utf-8')) for p in chunks)
+          assert domains == s['feeds']['domain']['count'], 'Domain chunk count mismatch'
+          for p in chunks:
+              assert sum(1 for _ in p.open(encoding='utf-8')) <= 120000, 'Oversized domain chunk'
+              assert p.stat().st_size < 10_000_000, 'Chunk exceeds 10MB'
+          print('Feeds validated:', {k:s['feeds'][k]['count'] for k in ['ip','domain','url']}, 'domain parts',len(chunks))
+          PY
+      - name: Prepare static index
+        run: |
+          touch public/.nojekyll
+          printf '%s\n' '<!doctype html><meta charset="utf-8"><title>SGB threat feeds</title><h1>SGB Threat Feeds</h1><p>Public threat feed files generated from SGB API.</p><ul><li><a href="ip-list.txt">IPv4</a></li><li><a href="domain-list.txt">Domains</a></li><li><a href="url-list.txt">URLs</a></li><li><a href="status.json">Status</a></li></ul>' > public/index.html
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
