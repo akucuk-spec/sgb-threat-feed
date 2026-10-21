@@ -57,6 +57,8 @@ def get_page(kind, page, retries=4):
                 payload = json.load(res)
             if not isinstance(payload, dict) or not isinstance(payload.get('models'), list):
                 raise ValueError('Unexpected API response schema')
+            if not payload['models'] and int(payload.get('totalCount') or 0) > 0:
+                raise ValueError(f'Empty API page {page} (attempt {attempt + 1}/{retries})')
             return payload
         except Exception as exc:
             if attempt == retries - 1:
@@ -102,6 +104,26 @@ def atomic_write(path, content):
 def save_lines(filename, values):
     atomic_write(ROOT / filename, '\n'.join(values) + ('\n' if values else ''))
 
+
+def rebuild_domain_parts_from_local():
+    """Rebuild partition files from the last successful full-domain TXT, without API access."""
+    path = ROOT / 'domain-list.txt'
+    if not path.is_file():
+        raise FileNotFoundError('Missing local domain-list.txt')
+    with path.open('r', encoding='utf-8-sig') as src:
+        values = [v for line in src if (v := valid('domain', line))]
+    values = sorted(set(values))
+    if not values:
+        raise ValueError('Local domain feed is empty')
+    active = set()
+    for i in range(0, len(values), DOMAIN_CHUNK):
+        name = f'domain-part-{i // DOMAIN_CHUNK + 1:02d}.txt'
+        save_lines(name, values[i:i + DOMAIN_CHUNK])
+        active.add(name)
+    for old in ROOT.glob('domain-part-*.txt'):
+        if old.name not in active:
+            old.unlink()
+    LOG.info('Rebuilt %d domain parts from local file (%d records)', len(active), len(values))
 
 def sync():
     ROOT.mkdir(parents=True, exist_ok=True)
@@ -174,8 +196,12 @@ def loop():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--once', action='store_true', help='One full sync, then exit')
+    parser.add_argument('--repartition-only', action='store_true', help='Rebuild domain chunks using cached local feed (no API)')
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    if args.repartition_only:
+        rebuild_domain_parts_from_local()
+        return
     if args.once:
         sync()
         return
